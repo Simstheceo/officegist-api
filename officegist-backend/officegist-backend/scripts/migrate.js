@@ -22,6 +22,8 @@ for (const file of fs.readdirSync(dir).filter((f) => f.endsWith('.sql')).sort())
     console.log(`apply  ${file}`);
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
+    // Demo data is optional: if it fails, say so and keep going so the API still starts. Schema failures stay fatal.
+    if (file.includes('seed')) { console.warn(`WARNING ${file} was skipped and rolled back: ${e.message}`); continue; }
     console.error(`FAILED ${file}: ${e.message}`);
     process.exitCode = 1;
     break;
