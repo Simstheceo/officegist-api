@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { q, tx } from '../db.js';
 import { requireRole } from '../auth.js';
-import { h, HttpError, paging } from '../http.js';
+import { h, HttpError, paging, clean, slugify, likePattern } from '../http.js';
 import { setStatus, ENT, notify } from '../lib/submit.js';
 
 export const admin = Router();
@@ -137,6 +137,119 @@ admin.post('/admin/users/:id/status', adminOnly, h(async (req, res) => {
     if (!u) throw new HttpError(404, 'User not found, or not a regular user.');
     if (d.status === 'SUSPENDED') await c.query('UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL', [id]);
     await audit(c, req.user.id, `USER_${d.status}`, 'USER', id, null, { status: d.status }, d.note);
+  });
+  res.json({ ok: true });
+}));
+
+// ---------- companies (admin) ----------
+const text = (min, max) => z.string().transform(clean).pipe(z.string().min(min).max(max));
+const httpUrl = z.string().trim().url().max(200).refine((u) => /^https?:\/\//i.test(u), 'Use a web address starting with http:// or https://');
+const BANDS = ['1-10', '11-50', '51-200', '201-500', '501-1,000', '1,001-5,000', '5,000+'];
+
+const companySchema = z.object({
+  name: text(2, 100),
+  industry: text(2, 60),                       // matched to an existing industry by name, or created
+  website: httpUrl.optional(),
+  description: text(0, 1500).optional(),
+  employeeBand: z.enum(BANDS).optional(),
+  locations: z.array(z.object({ city: text(2, 60), state: text(0, 60).optional(), isHq: z.boolean().default(false) })).min(1).max(10),
+  force: z.boolean().default(false),           // add even if a similar name exists
+});
+
+async function ensureIndustry(c, name) {
+  const { rows: [hit] } = await c.query('SELECT id FROM industries WHERE lower(name) = lower($1)', [name]);
+  if (hit) return hit.id;
+  const slug = slugify(name);
+  if (!slug) throw new HttpError(422, 'Enter a valid industry name.');
+  // If the slug already exists under a slightly different name ("Oil & Gas" vs "Oil and Gas"), reuse it.
+  const { rows: [row] } = await c.query('INSERT INTO industries(slug, name) VALUES ($1,$2) ON CONFLICT (slug) DO UPDATE SET slug = EXCLUDED.slug RETURNING id', [slug, name]);
+  return row.id;
+}
+
+async function uniqueSlug(c, name) {
+  const base = slugify(name);
+  if (!base) throw new HttpError(422, 'Enter a valid company name.');
+  for (let i = 1; i <= 50; i++) {
+    const s = i === 1 ? base : `${base}-${i}`;
+    const { rows } = await c.query('SELECT 1 FROM companies WHERE slug = $1', [s]);
+    if (!rows.length) return s;
+  }
+  throw new HttpError(409, 'Could not make a unique web address for this company.');
+}
+
+async function createCompany(c, d, adminId) {
+  if (!d.force) {
+    const { rows: similar } = await c.query(
+      `SELECT slug, name FROM companies WHERE lower(name) = lower($1) OR similarity(name, $1) >= 0.6 ORDER BY similarity(name, $1) DESC LIMIT 5`, [d.name]);
+    if (similar.length) throw new HttpError(409, 'A similar company already exists.', { similar });
+  }
+  const industryId = await ensureIndustry(c, d.industry);
+  const slug = await uniqueSlug(c, d.name);
+  const { rows: [co] } = await c.query(
+    `INSERT INTO companies(slug, name, industry_id, description, website, employee_band, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, slug`,
+    [slug, d.name, industryId, d.description || null, d.website || null, d.employeeBand || null, adminId]);
+  for (const [i, l] of d.locations.entries())
+    await c.query('INSERT INTO company_locations(company_id, city, state, is_hq) VALUES ($1,$2,$3,$4)', [co.id, l.city, l.state || null, l.isHq || i === 0]);
+  await audit(c, adminId, 'COMPANY_CREATED', 'COMPANY', co.id, null, { name: d.name, slug }, null);
+  return co.slug;
+}
+
+admin.get('/admin/companies', adminOnly, h(async (req, res) => {
+  const { limit, offset, page } = paging(req, 100);
+  const search = String(req.query.q || '').trim().slice(0, 80);
+  const { rows } = await q(
+    `SELECT c.slug, c.name, i.name AS industry, c.status, c.is_demo, (c.verified_at IS NOT NULL) AS verified, c.review_count, c.avg_rating, c.created_at,
+            (SELECT l.city FROM company_locations l WHERE l.company_id = c.id ORDER BY l.is_hq DESC, l.city LIMIT 1) AS city
+       FROM companies c LEFT JOIN industries i ON i.id = c.industry_id
+      WHERE ($1::text IS NULL OR c.name ILIKE $1)
+      ORDER BY c.is_demo ASC, c.created_at DESC LIMIT $2 OFFSET $3`, [search ? likePattern(search) : null, limit, offset]);
+  res.json({ page, limit, items: rows });
+}));
+
+admin.post('/admin/companies', adminOnly, h(async (req, res) => {
+  const d = companySchema.parse(req.body);
+  const slug = await tx((c) => createCompany(c, d, req.user.id));
+  res.status(201).json({ slug });
+}));
+
+// Bulk add: each row succeeds or fails on its own, so one bad row never blocks the rest. Similar names are skipped, not guessed at.
+admin.post('/admin/companies/bulk', adminOnly, h(async (req, res) => {
+  const { rows } = z.object({ rows: z.array(z.object({
+    name: z.string(), industry: z.string(), city: z.string(), state: z.string().optional(), website: z.string().optional(),
+  })).min(1).max(100) }).parse(req.body);
+  const results = [];
+  for (const [i, r] of rows.entries()) {
+    const parsed = companySchema.safeParse({
+      name: r.name, industry: r.industry, website: r.website || undefined,
+      locations: [{ city: r.city, state: r.state || undefined, isHq: true }],
+    });
+    if (!parsed.success) { results.push({ row: i + 1, name: r.name, status: 'error', message: parsed.error.issues[0].path.join('.') + ': ' + parsed.error.issues[0].message }); continue; }
+    try {
+      const slug = await tx((c) => createCompany(c, parsed.data, req.user.id));
+      results.push({ row: i + 1, name: r.name, status: 'created', slug });
+    } catch (e) {
+      if (e instanceof HttpError && e.status === 409 && e.extra.similar) results.push({ row: i + 1, name: r.name, status: 'skipped', message: `Similar to "${e.extra.similar[0].name}"` });
+      else results.push({ row: i + 1, name: r.name, status: 'error', message: e instanceof HttpError ? e.message : 'Unexpected error' });
+    }
+  }
+  res.json({ results });
+}));
+
+// Edit basics, or hide/show a company (hidden companies disappear from the public site; nothing is deleted).
+admin.patch('/admin/companies/:slug', adminOnly, h(async (req, res) => {
+  const d = z.object({
+    description: text(0, 1500).optional(), website: httpUrl.optional(), employeeBand: z.enum(BANDS).optional(),
+    industry: text(2, 60).optional(), status: z.enum(['ACTIVE', 'HIDDEN']).optional(),
+  }).parse(req.body);
+  await tx(async (c) => {
+    const { rows: [before] } = await c.query('SELECT id, description, website, employee_band, industry_id, status FROM companies WHERE slug = $1 FOR UPDATE', [req.params.slug]);
+    if (!before) throw new HttpError(404, 'Company not found.');
+    const industryId = d.industry ? await ensureIndustry(c, d.industry) : null;
+    await c.query(
+      `UPDATE companies SET description = COALESCE($1, description), website = COALESCE($2, website), employee_band = COALESCE($3, employee_band),
+              industry_id = COALESCE($4, industry_id), status = COALESCE($5, status) WHERE id = $6`,
+      [d.description ?? null, d.website ?? null, d.employeeBand ?? null, industryId, d.status ?? null, before.id]);
+    await audit(c, req.user.id, d.status ? `COMPANY_${d.status}` : 'COMPANY_EDITED', 'COMPANY', before.id, before, d, null);
   });
   res.json({ ok: true });
 }));

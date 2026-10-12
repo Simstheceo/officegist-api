@@ -12,6 +12,8 @@ import { config } from '../config.js';
 
 export const account = Router();
 const text = (min, max) => z.string().transform(clean).pipe(z.string().min(min).max(max));
+// Only http(s) links: a "javascript:" address in a clickable link would run code in a visitor's browser.
+const httpUrl = (max) => z.string().trim().url().max(max).refine((u) => /^https?:\/\//i.test(u), 'Use a web address starting with http:// or https://');
 
 // Brute-force protection on credential endpoints: 10 attempts per 15 minutes per IP.
 const authLimit = rateLimit({ windowMs: 15 * 60e3, limit: 10, standardHeaders: true, legacyHeaders: false });
@@ -167,7 +169,7 @@ async function requireMember(userId, companyId) {
 
 // Verified employers may edit profile basics. Text is screened; anything flagged is refused rather than published.
 account.patch('/companies/:slug', requireAuth, h(async (req, res) => {
-  const d = z.object({ description: text(0, 1500).optional(), website: z.string().url().max(200).optional(), logoUrl: z.string().url().max(300).optional() }).parse(req.body);
+  const d = z.object({ description: text(0, 1500).optional(), website: httpUrl(200).optional(), logoUrl: httpUrl(300).optional() }).parse(req.body);
   const { rows: [c] } = await q(`SELECT id FROM companies WHERE slug = $1`, [req.params.slug]);
   if (!c) throw new HttpError(404, 'Company not found.');
   await requireMember(req.user.id, c.id);
