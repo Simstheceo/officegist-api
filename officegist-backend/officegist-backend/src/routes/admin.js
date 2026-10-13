@@ -253,3 +253,42 @@ admin.patch('/admin/companies/:slug', adminOnly, h(async (req, res) => {
   });
   res.json({ ok: true });
 }));
+
+// ---------- company suggestions (admin) ----------
+admin.get('/admin/suggestions', adminOnly, h(async (req, res) => {
+  const { rows } = await q(`SELECT id, name, industry, city, state, website, created_at FROM company_suggestions WHERE status = 'PENDING' ORDER BY created_at LIMIT 100`);
+  // Show likely duplicates next to each suggestion so a reviewer does not add the same company twice.
+  const items = await Promise.all(rows.map(async (s) => ({
+    ...s,
+    similar: (await q(`SELECT slug, name FROM companies WHERE similarity(name, $1) >= 0.4 ORDER BY similarity(name, $1) DESC LIMIT 3`, [s.name])).rows,
+  })));
+  res.json(items);
+}));
+
+// Approve (optionally correcting the details first) or reject. Approving creates the real company and tells the person who suggested it.
+admin.post('/admin/suggestions/:id/decision', adminOnly, h(async (req, res) => {
+  const d = z.object({
+    status: z.enum(['APPROVED', 'REJECTED']),
+    note: z.string().trim().max(300).optional(),
+    edits: z.object({ name: text(2, 100).optional(), industry: text(2, 60).optional(), city: text(2, 60).optional(), state: text(0, 60).optional(), website: httpUrl.optional() }).optional(),
+  }).parse(req.body);
+  const id = uuid.parse(req.params.id);
+  const out = await tx(async (c) => {
+    const { rows: [s] } = await c.query(`SELECT * FROM company_suggestions WHERE id = $1 AND status = 'PENDING' FOR UPDATE`, [id]);
+    if (!s) throw new HttpError(404, 'No pending suggestion with that id.');
+    const e = d.edits || {};
+    let slug = null;
+    if (d.status === 'APPROVED') {
+      slug = await createCompany(c, {
+        name: e.name ?? s.name, industry: e.industry ?? s.industry, website: e.website ?? s.website ?? undefined,
+        locations: [{ city: e.city ?? s.city, state: (e.state ?? s.state) || undefined, isHq: true }], force: true,   // an admin has already looked at it
+      }, req.user.id);
+    }
+    await c.query(`UPDATE company_suggestions SET status = $1, decided_by = $2, decided_at = now(), note = $3, company_slug = $4 WHERE id = $5`,
+      [d.status, req.user.id, d.note || null, slug, id]);
+    await audit(c, req.user.id, `SUGGESTION_${d.status}`, 'COMPANY_SUGGESTION', id, { name: s.name }, { slug }, d.note);
+    await notify(c, s.user_id, `SUGGESTION_${d.status}`, { name: e.name ?? s.name, slug });
+    return { slug };
+  });
+  res.json(out);
+}));

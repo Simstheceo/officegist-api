@@ -5,6 +5,7 @@ import { q, tx } from '../db.js';
 import { requireAuth, dailyCap } from '../auth.js';
 import { h, HttpError, clean, norm, slugify } from '../http.js';
 import { sha256 } from '../lib/crypto.js';
+import { scanText } from '../lib/moderation.js';
 import { submit, resubmit, ENT, notify } from '../lib/submit.js';
 
 export const contrib = Router();
@@ -258,4 +259,37 @@ contrib.post('/reports', requireAuth, reportLimit, h(async (req, res) => {
     }
   });
   res.status(201).json({ ok: true, message: 'Thanks. Our moderators will take a look.' });
+}));
+
+// ---------- suggest a company that is not on the site yet ----------
+const httpUrl = z.string().trim().url().max(200).refine((u) => /^https?:\/\//i.test(u), 'Use a web address starting with http:// or https://');
+const suggestSchema = z.object({
+  name: text(2, 100), industry: text(2, 60), city: text(2, 60), state: text(0, 60).optional(),
+  website: httpUrl.optional(), force: z.boolean().default(false),   // force = "it is a different company from the similar ones you showed me"
+});
+// These fields are labels, not stories. Contact details, links, spam or abuse in them are refused outright.
+// (Names that merely look like a person's name, such as "Mr Biggs", are fine.)
+const REFUSE = ['PHONE_NUMBER', 'EMAIL_ADDRESS', 'HOME_ADDRESS', 'LINK', 'SPAM', 'THREAT', 'HATE_SPEECH', 'PROFANITY'];
+
+contrib.post('/companies/suggest', requireAuth, dailyCap('company_suggestions', 5), h(async (req, res) => {
+  const d = suggestSchema.parse(req.body);
+  const flags = scanText([d.name, d.industry, d.city, d.state].filter(Boolean).join('\n')).flags;
+  if (flags.some((f) => REFUSE.includes(f)))
+    throw new HttpError(422, 'Please enter only the company name and place. Contact details, links and unsuitable wording are not allowed here.');
+
+  const { rows: similar } = await q(
+    `SELECT slug, name FROM companies WHERE status = 'ACTIVE' AND (lower(name) = lower($1) OR similarity(name, $1) >= 0.6)
+      ORDER BY similarity(name, $1) DESC LIMIT 5`, [d.name]);
+  const exact = similar.some((s) => s.name.toLowerCase() === d.name.toLowerCase());
+  if (exact || (similar.length && !d.force))
+    throw new HttpError(409, exact ? 'This company is already on OfficeGist.' : 'A similar company already exists.', { similar, exact });
+
+  try {
+    await q('INSERT INTO company_suggestions(user_id, name, industry, city, state, website) VALUES ($1,$2,$3,$4,$5,$6)',
+      [req.user.id, d.name, d.industry, d.city, d.state || null, d.website || null]);
+  } catch (e) {
+    if (e.code === '23505') throw new HttpError(409, 'Someone has already suggested this company. We will add it soon.');
+    throw e;
+  }
+  res.status(201).json({ ok: true, message: 'Thank you. We will check it and let you know when it is live.' });
 }));
