@@ -292,3 +292,50 @@ admin.post('/admin/suggestions/:id/decision', adminOnly, h(async (req, res) => {
   });
   res.json(out);
 }));
+
+// ---------- sample (demo) data ----------
+// Everything seeded as sample content carries is_demo = true, so it can be told apart from real contributions.
+const DEMO_IDS = `
+  SELECT 'REVIEW'::entity_type AS t, id FROM reviews WHERE is_demo
+  UNION ALL SELECT 'GIST'::entity_type, id FROM gists WHERE is_demo
+  UNION ALL SELECT 'GIST_COMMENT'::entity_type, id FROM gist_comments WHERE is_demo
+  UNION ALL SELECT 'SALARY_REPORT'::entity_type, id FROM salary_reports WHERE is_demo
+  UNION ALL SELECT 'INTERVIEW'::entity_type, id FROM interviews WHERE is_demo`;
+
+admin.get('/admin/demo', adminOnly, h(async (req, res) => {
+  const { rows: [r] } = await q(`
+    SELECT (SELECT count(*) FROM companies WHERE is_demo)::int AS companies,
+           (SELECT count(*) FROM reviews WHERE is_demo)::int AS reviews,
+           (SELECT count(*) FROM gists WHERE is_demo)::int AS gists,
+           (SELECT count(*) FROM gist_comments WHERE is_demo)::int AS comments,
+           (SELECT count(*) FROM salary_reports WHERE is_demo)::int AS salaries,
+           (SELECT count(*) FROM interviews WHERE is_demo)::int AS interviews,
+           (SELECT count(*) FROM companies c WHERE c.is_demo AND (
+               EXISTS (SELECT 1 FROM reviews x WHERE x.company_id = c.id AND NOT x.is_demo)
+            OR EXISTS (SELECT 1 FROM salary_reports x WHERE x.company_id = c.id AND NOT x.is_demo)
+            OR EXISTS (SELECT 1 FROM interviews x WHERE x.company_id = c.id AND NOT x.is_demo)))::int AS companies_with_real_content`);
+  res.json(r);
+}));
+
+// Permanently removes all sample content. Real contributions are never touched.
+// A sample company that real people have already written about is hidden instead of deleted.
+admin.post('/admin/demo/purge', adminOnly, h(async (req, res) => {
+  z.object({ confirm: z.literal('REMOVE') }).parse(req.body);
+  const out = await tx(async (c) => {
+    await c.query(`WITH d AS (${DEMO_IDS}) DELETE FROM moderation_queue m USING d WHERE m.entity_type = d.t AND m.entity_id = d.id`);
+    await c.query(`WITH d AS (${DEMO_IDS}) DELETE FROM reports r USING d WHERE r.entity_type = d.t AND r.entity_id = d.id`);
+    const deleted = {};
+    for (const table of ['reviews', 'gists', 'gist_comments', 'salary_reports', 'interviews'])
+      deleted[table] = (await c.query(`DELETE FROM ${table} WHERE is_demo`)).rowCount;
+    const { rowCount: companiesRemoved } = await c.query(
+      `DELETE FROM companies c WHERE c.is_demo
+          AND NOT EXISTS (SELECT 1 FROM reviews x WHERE x.company_id = c.id)
+          AND NOT EXISTS (SELECT 1 FROM salary_reports x WHERE x.company_id = c.id)
+          AND NOT EXISTS (SELECT 1 FROM interviews x WHERE x.company_id = c.id)`);
+    const { rowCount: companiesHidden } = await c.query(`UPDATE companies SET status = 'HIDDEN' WHERE is_demo AND status = 'ACTIVE'`);
+    const result = { ...deleted, companiesRemoved, companiesHidden };
+    await audit(c, req.user.id, 'DEMO_DATA_PURGED', 'SYSTEM', null, null, result, null);
+    return result;
+  });
+  res.json(out);
+}));
